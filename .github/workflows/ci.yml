@@ -22,8 +22,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Verify TARGET_REPO validation behavior
+      - name: Verify script validation behavior
         run: bash scripts/test-target-repo-validation.sh
+      - name: Verify run-loop backoff validation behavior
+        run: bash scripts/test-run-loop-backoff-validation.sh
 
   hadolint:
     name: Hadolint

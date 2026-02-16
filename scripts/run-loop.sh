@@ -84,13 +84,23 @@ lock_dir="/tmp/agent-locks"
 periodic_interval="${PERIODIC_INTERVAL_SECS:-${BASE_SECS:-3600}}"
 periodic_jitter="${PERIODIC_JITTER_SECS:-${JITTER_SECS:-300}}"
 max_failures="${MAX_CONSECUTIVE_FAILURES:-5}"
+periodic_agent_failure_backoff_base_secs="${PERIODIC_AGENT_FAILURE_BACKOFF_BASE_SECS:-300}"
+periodic_agent_failure_backoff_max_secs="${PERIODIC_AGENT_FAILURE_BACKOFF_MAX_SECS:-3600}"
+periodic_agent_failure_backoff_jitter_pct="${PERIODIC_AGENT_FAILURE_BACKOFF_JITTER_PCT:-15}"
 
 # Mention watching (opt-in)
 watch_mentions="${WATCH_MENTIONS:-}"
 watch_poll_interval="${WATCH_POLL_INTERVAL:-300}"
 
 # Validate numeric settings
-for var_name in periodic_interval periodic_jitter max_failures; do
+for var_name in \
+  periodic_interval \
+  periodic_jitter \
+  max_failures \
+  periodic_agent_failure_backoff_base_secs \
+  periodic_agent_failure_backoff_max_secs \
+  periodic_agent_failure_backoff_jitter_pct
+do
   val="${!var_name}"
   case "$val" in
     ''|*[!0-9]*) echo "${var_name} must be a non-negative integer" >&2; exit 1 ;;
@@ -102,6 +112,19 @@ if [ "$periodic_interval" -le 0 ]; then
 fi
 if [ "$max_failures" -le 0 ]; then
   echo "MAX_CONSECUTIVE_FAILURES must be > 0" >&2; exit 1
+fi
+if [ "$periodic_agent_failure_backoff_base_secs" -le 0 ]; then
+  echo "PERIODIC_AGENT_FAILURE_BACKOFF_BASE_SECS must be > 0" >&2; exit 1
+fi
+if [ "$periodic_agent_failure_backoff_max_secs" -le 0 ]; then
+  echo "PERIODIC_AGENT_FAILURE_BACKOFF_MAX_SECS must be > 0" >&2; exit 1
+fi
+if [ "$periodic_agent_failure_backoff_max_secs" -lt "$periodic_agent_failure_backoff_base_secs" ]; then
+  echo "PERIODIC_AGENT_FAILURE_BACKOFF_MAX_SECS must be >= PERIODIC_AGENT_FAILURE_BACKOFF_BASE_SECS" >&2
+  exit 1
+fi
+if [ "$periodic_agent_failure_backoff_jitter_pct" -gt 100 ]; then
+  echo "PERIODIC_AGENT_FAILURE_BACKOFF_JITTER_PCT must be <= 100" >&2; exit 1
 fi
 
 if [ "$watch_mentions" = "1" ]; then
@@ -399,14 +422,50 @@ trap cleanup EXIT
 trap handle_shutdown TERM INT
 
 # Try to run an agent with per-agent flock.
-# Returns 0 if the agent was busy (lock not acquired) or ran successfully.
-# Returns non-zero only on actual run-once.sh failure, allowing callers
-# to distinguish between "nothing wrong" and "agent run crashed."
+# Returns 0 only when run-once.sh succeeds.
+# Returns AGENT_RUN_EXIT_BUSY when lock is already held.
+# Returns non-zero for actual run-once.sh failure.
 #
 # Args: agent_id extra_prompt [ack_key state_file]
 # When ack_key + state_file are provided and the run succeeds (exit 0),
 # calls `hivemoot ack` to mark the mention as read. On failure the mention
 # stays unread so the next poll cycle retries it.
+AGENT_RUN_EXIT_BUSY=42
+
+compute_failure_backoff_delay() {
+  local failures="$1"
+  local backoff="$periodic_agent_failure_backoff_base_secs"
+  local cap="$periodic_agent_failure_backoff_max_secs"
+  local jitter_pct="$periodic_agent_failure_backoff_jitter_pct"
+  local remaining_doubles=$((failures - 1))
+
+  while [ "$remaining_doubles" -gt 0 ] && [ "$backoff" -lt "$cap" ]; do
+    if [ "$backoff" -gt $((cap / 2)) ]; then
+      backoff="$cap"
+      break
+    fi
+    backoff=$((backoff * 2))
+    remaining_doubles=$((remaining_doubles - 1))
+  done
+
+  if [ "$backoff" -gt "$cap" ]; then
+    backoff="$cap"
+  fi
+
+  if [ "$jitter_pct" -gt 0 ]; then
+    local jitter_range=$((backoff * jitter_pct / 100))
+    if [ "$jitter_range" -gt 0 ]; then
+      local jitter_offset=$((RANDOM % (2 * jitter_range + 1) - jitter_range))
+      backoff=$((backoff + jitter_offset))
+      if [ "$backoff" -lt 1 ]; then
+        backoff=1
+      fi
+    fi
+  fi
+
+  printf '%s' "$backoff"
+}
+
 try_run_agent() {
   local agent_id="$1"
   local extra_prompt="$2"
@@ -422,7 +481,7 @@ try_run_agent() {
   mkdir -p "$agent_workspace" "$agent_log_dir" "$agent_home"
 
   (
-    flock -n 200 || { log "${agent_id}: busy, skipping"; exit 0; }
+    flock -n 200 || { log "${agent_id}: busy, skipping"; exit "$AGENT_RUN_EXIT_BUSY"; }
 
     log "${agent_id}: lock acquired, starting run"
 
@@ -562,6 +621,8 @@ start_periodic_scheduler() {
 
   (
     consecutive_failures=0
+    declare -A agent_failure_count=()
+    declare -A agent_next_retry_at=()
 
     # This subshell terminates via SIGTERM from handle_shutdown, not via
     # a shared variable (subshells get a frozen copy of parent state).
@@ -583,22 +644,64 @@ start_periodic_scheduler() {
       log "Periodic: starting cycle for ${agent_count} agents"
 
       declare -a cycle_pids=()
+      declare -a cycle_agent_ids=()
+      cycle_any_success=0
+      cycle_any_failures=0
       for index in "${!agent_ids[@]}"; do
         aid="${agent_ids[$index]}"
+        now_epoch="$(date +%s)"
+
+        failure_count="${agent_failure_count[$aid]:-0}"
+        next_retry_at="${agent_next_retry_at[$aid]:-0}"
+        if [ "$failure_count" -gt 0 ] && [ "$now_epoch" -lt "$next_retry_at" ]; then
+          remaining=$((next_retry_at - now_epoch))
+          log "Periodic: ${aid} in failure cooldown (${remaining}s remaining)"
+          continue
+        fi
 
         try_run_agent "$aid" "$global_extra_prompt" &
         cycle_pids+=($!)
+        cycle_agent_ids+=("$aid")
       done
+
+      if [ "${#cycle_pids[@]}" -eq 0 ]; then
+        log "Periodic: no agents eligible this cycle (all cooling down)"
+        continue
+      fi
 
       # Wait for all agent runs and track results
-      cycle_ok=0
-      for pid in "${cycle_pids[@]}"; do
+      for index in "${!cycle_pids[@]}"; do
+        pid="${cycle_pids[$index]}"
+        aid="${cycle_agent_ids[$index]}"
+        run_exit=0
+
         if wait "$pid" 2>/dev/null; then
-          cycle_ok=1
+          run_exit=0
+        else
+          run_exit=$?
         fi
+
+        if [ "$run_exit" -eq 0 ]; then
+          cycle_any_success=1
+          agent_failure_count["$aid"]=0
+          unset "agent_next_retry_at[$aid]"
+          continue
+        fi
+
+        if [ "$run_exit" -eq "$AGENT_RUN_EXIT_BUSY" ]; then
+          continue
+        fi
+
+        cycle_any_failures=1
+        next_failure_count=$(( ${agent_failure_count[$aid]:-0} + 1 ))
+        agent_failure_count["$aid"]="$next_failure_count"
+        backoff_delay="$(compute_failure_backoff_delay "$next_failure_count")"
+        next_retry_at=$(( $(date +%s) + backoff_delay ))
+        agent_next_retry_at["$aid"]="$next_retry_at"
+        log "Periodic: ${aid} failed; next retry in ${backoff_delay}s (consecutive failures=${next_failure_count})"
       done
 
-      if [ "$cycle_ok" -eq 1 ]; then
+      if [ "$cycle_any_failures" -eq 0 ] || [ "$cycle_any_success" -eq 1 ]; then
         consecutive_failures=0
         log "Periodic: cycle completed"
       else
@@ -622,6 +725,7 @@ start_periodic_scheduler() {
 
 log "Loop mode starting: ${agent_count} agents, repo=${target_repo:-unset}"
 log "  Periodic interval: ${periodic_interval}s +/-${periodic_jitter}s"
+log "  Failure backoff: base=${periodic_agent_failure_backoff_base_secs}s max=${periodic_agent_failure_backoff_max_secs}s jitter=${periodic_agent_failure_backoff_jitter_pct}%"
 if [ "$watch_mentions" = "1" ]; then
   log "  Mention watching: enabled (poll interval: ${watch_poll_interval}s)"
 else

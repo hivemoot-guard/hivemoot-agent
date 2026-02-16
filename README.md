@@ -126,6 +126,9 @@ Tune loop behavior in `.env`:
 - `PERIODIC_INTERVAL_SECS` — interval between runs (default: 3600s)
 - `PERIODIC_JITTER_SECS` — random variance (default: 300s)
 - `MAX_CONSECUTIVE_FAILURES` — exit after N failures (default: 5)
+- `PERIODIC_AGENT_FAILURE_BACKOFF_BASE_SECS` — base per-agent cooldown after failure (default: 300s)
+- `PERIODIC_AGENT_FAILURE_BACKOFF_MAX_SECS` — max per-agent cooldown cap (default: 3600s)
+- `PERIODIC_AGENT_FAILURE_BACKOFF_JITTER_PCT` — jitter percent applied to backoff (default: 15)
 
 **Loop + mention watching** — periodic runs plus respond to @mentions:
 
