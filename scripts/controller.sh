@@ -494,6 +494,7 @@ start_mention_watcher() {
   log "Starting mention watcher for ${agent_id}"
 
   (
+    trap 'command -v pkill >/dev/null 2>&1 && pkill -TERM -P "$$" >/dev/null 2>&1 || true; exit 0' TERM INT
     local restart_delay=5
     local max_delay=300
     local start_time=0
