@@ -606,7 +606,6 @@ process_queue() {
   local -a trigger_files=()
   local trigger_file=""
   local processing_file=""
-  local done_file=""
   local failed_file=""
   local trigger_type=""
   local repo=""
@@ -631,7 +630,6 @@ process_queue() {
     fi
 
     processing_file="${trigger_file%.trigger.json}.processing"
-    done_file="${trigger_file%.trigger.json}.done"
     failed_file="${trigger_file%.trigger.json}.failed"
 
     if ! mv "$trigger_file" "$processing_file" 2>/dev/null; then
@@ -713,8 +711,8 @@ process_queue() {
     fi
 
     job_id="$(generate_job_id)"
-    if launch_job "$job_id" "$repo" "$agent_id" "$trigger_type" "$extra_prompt" "$ack_key" "$state_file" "$session_key"; then
-      mv -f "$processing_file" "$done_file"
+    if launch_job "$job_id" "$repo" "$agent_id" "$trigger_type" "$extra_prompt" "$ack_key" "$state_file" "$session_key" "$processing_file"; then
+      :
     else
       mv -f "$processing_file" "$failed_file"
     fi
@@ -768,25 +766,48 @@ record_job_completion() {
   local job_id="${pid_to_job_id[$pid]:-unknown}"
   local repo="${pid_to_repo[$pid]:-unknown}"
   local agent_id="${pid_to_agent[$pid]:-unknown}"
+  local trigger_type="${pid_to_trigger_type[$pid]:-periodic}"
   local ack_key="${pid_to_ack_key[$pid]:-}"
   local state_file="${pid_to_state_file[$pid]:-}"
+  local processing_file="${pid_to_processing_file[$pid]:-}"
+  local final_file=""
+  local final_state="failed"
+  local ack_successful=0
 
   unset \
     "pid_to_job_id[$pid]" \
     "pid_to_repo[$pid]" \
     "pid_to_agent[$pid]" \
+    "pid_to_trigger_type[$pid]" \
     "pid_to_ack_key[$pid]" \
-    "pid_to_state_file[$pid]"
+    "pid_to_state_file[$pid]" \
+    "pid_to_processing_file[$pid]"
 
   if [ "$exit_code" -eq 0 ]; then
-    completed_jobs=$((completed_jobs + 1))
-    log "Job completed: id=${job_id} repo=${repo} agent=${agent_id}"
-    if [ -n "$ack_key" ] && [ -n "$state_file" ]; then
-      ack_mention "$agent_id" "$ack_key" "$state_file" || true
+    if [ "$trigger_type" = "mention" ] && [ -n "$ack_key" ] && [ -n "$state_file" ]; then
+      if ack_mention "$agent_id" "$ack_key" "$state_file"; then
+        ack_successful=1
+      fi
+    else
+      ack_successful=1
+    fi
+
+    if [ "$ack_successful" -eq 1 ]; then
+      completed_jobs=$((completed_jobs + 1))
+      final_state="done"
+      log "Job completed: id=${job_id} repo=${repo} agent=${agent_id}"
+    else
+      failed_jobs=$((failed_jobs + 1))
+      log "Job failed: id=${job_id} repo=${repo} agent=${agent_id} ack_failed=1"
     fi
   else
     failed_jobs=$((failed_jobs + 1))
     log "Job failed: id=${job_id} repo=${repo} agent=${agent_id} exit=${exit_code}"
+  fi
+
+  if [ -n "$processing_file" ] && [ -f "$processing_file" ]; then
+    final_file="${processing_file%.processing}.${final_state}"
+    mv -f "$processing_file" "$final_file" 2>/dev/null || true
   fi
 }
 
@@ -946,6 +967,7 @@ launch_job() {
   local ack_key="${6:-}"
   local state_file="${7:-}"
   local session_key="${8:-}"
+  local processing_file="${9:-}"
 
   ensure_repo_lock_file "$repo"
 
@@ -962,8 +984,10 @@ launch_job() {
   pid_to_job_id["$pid"]="$job_id"
   pid_to_repo["$pid"]="$repo"
   pid_to_agent["$pid"]="$agent_id"
+  pid_to_trigger_type["$pid"]="$trigger_type"
   pid_to_ack_key["$pid"]="$ack_key"
   pid_to_state_file["$pid"]="$state_file"
+  pid_to_processing_file["$pid"]="$processing_file"
 
   log "Queued job: id=${job_id} repo=${repo} agent=${agent_id} trigger=${trigger_type}"
 }
@@ -1084,8 +1108,10 @@ declare -a watcher_pids=()
 declare -A pid_to_job_id=()
 declare -A pid_to_repo=()
 declare -A pid_to_agent=()
+declare -A pid_to_trigger_type=()
 declare -A pid_to_ack_key=()
 declare -A pid_to_state_file=()
+declare -A pid_to_processing_file=()
 declare -A agent_token_files=()
 declare -A repo_lock_files=()
 

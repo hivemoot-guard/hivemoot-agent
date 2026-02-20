@@ -18,6 +18,18 @@ assert_file_contains() {
   fi
 }
 
+assert_file_not_contains() {
+  local file="$1"
+  local unexpected="$2"
+
+  if grep -Fq -- "$unexpected" "$file"; then
+    echo "Did not expect to find: $unexpected" >&2
+    echo "In file: $file" >&2
+    sed 's/^/  /' "$file" >&2 || true
+    fail "unexpected content found"
+  fi
+}
+
 assert_eq() {
   local expected="$1"
   local actual="$2"
@@ -522,6 +534,106 @@ EOF_TRIGGER
   echo "PASS: stale processing triggers are recovered and executed"
 }
 
+run_mentions_retry_after_failure_case() {
+  local repo_root="$1"
+  local case_dir="$2"
+  local run1_log=""
+  local run2_log=""
+  local watch_output=""
+  local mention_failed_count=0
+  local mention_completed_count=0
+  local ack_log=""
+  local ack_count=""
+  local expected_ack_key="thread-retry:2026-02-20T04:21:00Z"
+  local expected_state_file="${case_dir}/workspace/watch-state/worker.json"
+  local summary_file=""
+  local -a summary_files=()
+
+  mkdir -p "$case_dir"
+  setup_mock_docker "${case_dir}/mock-bin"
+  setup_mock_hivemoot "${case_dir}/mock-bin"
+
+  watch_output='{"threadId":"thread-retry","number":88,"title":"Retry mention","author":"hivemoot","body":"@hivemoot-guard retry this","url":"https://github.com/hivemoot/hivemoot-agent/pull/132#issuecomment-2","timestamp":"2026-02-20T04:21:00Z"}'
+  run1_log="${case_dir}/controller-run1.log"
+
+  if env -i \
+    PATH="${case_dir}/mock-bin:${PATH}" \
+    HOME="${case_dir}/home" \
+    MOCK_DOCKER_STATE_DIR="${case_dir}/mock-state" \
+    MOCK_DOCKER_WAIT_SLEEP_SECS="0" \
+    MOCK_DOCKER_WAIT_EXIT="17" \
+    MOCK_HIVEMOOT_STATE_DIR="${case_dir}/hivemoot-state" \
+    MOCK_HIVEMOOT_WATCH_OUTPUT="${watch_output}" \
+    TARGET_REPO="owner/repo" \
+    CONTROLLER_RUN_MODE="once" \
+    CONTROLLER_MAX_WORKERS="1" \
+    CONTROLLER_WORKSPACE_ROOT="${case_dir}/workspace" \
+    WORKER_IMAGE="hivemoot-agent:test" \
+    WATCH_MENTIONS="1" \
+    WATCH_POLL_INTERVAL="30" \
+    AGENT_ID_01="worker" \
+    AGENT_GITHUB_TOKEN_01="token-1" \
+    AGENT_TIMEOUT_SECONDS="120" \
+    PERIODIC_INTERVAL_SECS="60" \
+    PERIODIC_JITTER_SECS="0" \
+    bash "${repo_root}/scripts/controller.sh" >"$run1_log" 2>&1; then
+    fail "first controller run unexpectedly succeeded in mention retry case"
+  fi
+
+  run2_log="${case_dir}/controller-run2.log"
+  env -i \
+    PATH="${case_dir}/mock-bin:${PATH}" \
+    HOME="${case_dir}/home" \
+    MOCK_DOCKER_STATE_DIR="${case_dir}/mock-state" \
+    MOCK_DOCKER_WAIT_SLEEP_SECS="0" \
+    MOCK_DOCKER_WAIT_EXIT="0" \
+    MOCK_HIVEMOOT_STATE_DIR="${case_dir}/hivemoot-state" \
+    MOCK_HIVEMOOT_WATCH_OUTPUT="${watch_output}" \
+    TARGET_REPO="owner/repo" \
+    CONTROLLER_RUN_MODE="once" \
+    CONTROLLER_MAX_WORKERS="1" \
+    CONTROLLER_WORKSPACE_ROOT="${case_dir}/workspace" \
+    WORKER_IMAGE="hivemoot-agent:test" \
+    WATCH_MENTIONS="1" \
+    WATCH_POLL_INTERVAL="30" \
+    AGENT_ID_01="worker" \
+    AGENT_GITHUB_TOKEN_01="token-1" \
+    AGENT_TIMEOUT_SECONDS="120" \
+    PERIODIC_INTERVAL_SECS="60" \
+    PERIODIC_JITTER_SECS="0" \
+    bash "${repo_root}/scripts/controller.sh" >"$run2_log" 2>&1
+
+  assert_file_contains "$run2_log" "worker: queued mention trigger for #88"
+  assert_file_not_contains "$run2_log" "duplicate mention suppressed (ack_key=${expected_ack_key})"
+
+  shopt -s nullglob
+  summary_files=("${case_dir}/workspace"/workspaces/*/.hivemoot/summary)
+  shopt -u nullglob
+
+  for summary_file in "${summary_files[@]}"; do
+    if ! grep -Fq 'trigger=mention' "$summary_file"; then
+      continue
+    fi
+    if grep -Fq 'status=failed' "$summary_file"; then
+      mention_failed_count=$((mention_failed_count + 1))
+    fi
+    if grep -Fq 'status=completed' "$summary_file"; then
+      mention_completed_count=$((mention_completed_count + 1))
+    fi
+  done
+
+  assert_eq "1" "$mention_failed_count" "expected one failed mention run before retry"
+  assert_eq "1" "$mention_completed_count" "expected one completed mention retry run"
+
+  ack_log="${case_dir}/hivemoot-state/ack.log"
+  [ -f "$ack_log" ] || fail "missing ack log in mention retry case"
+  ack_count="$(wc -l < "$ack_log" | tr -d '[:space:]')"
+  assert_eq "1" "$ack_count" "expected exactly one ack after retry success"
+  assert_file_contains "$ack_log" "${expected_ack_key}|${expected_state_file}"
+
+  echo "PASS: failed mention jobs are retried on re-emitted events"
+}
+
 run_shutdown_signal_case() {
   local repo_root="$1"
   local case_dir="$2"
@@ -596,5 +708,6 @@ run_failure_case "$repo_root" "${tmpdir}/failure"
 run_mentions_case "$repo_root" "${tmpdir}/mentions"
 run_mentions_dedup_case "$repo_root" "${tmpdir}/mentions-dedup"
 run_orphan_recovery_case "$repo_root" "${tmpdir}/orphan-recovery"
+run_mentions_retry_after_failure_case "$repo_root" "${tmpdir}/mentions-retry"
 run_shutdown_signal_case "$repo_root" "${tmpdir}/shutdown"
 echo "PASS: controller script checks"
