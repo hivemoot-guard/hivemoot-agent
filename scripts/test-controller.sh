@@ -155,6 +155,60 @@ EOF_MOCK
   chmod +x "${mock_bin}/docker"
 }
 
+setup_mock_hivemoot() {
+  local mock_bin="$1"
+  mkdir -p "$mock_bin"
+
+  cat > "${mock_bin}/hivemoot" <<'EOF_MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+
+state_dir="${MOCK_HIVEMOOT_STATE_DIR:?MOCK_HIVEMOOT_STATE_DIR is required}"
+mkdir -p "$state_dir"
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  watch)
+    printf '%s\n' "$*" >> "${state_dir}/watch.log"
+    if [ "${MOCK_HIVEMOOT_WATCH_FAIL:-0}" = "1" ]; then
+      exit 1
+    fi
+    if [ -n "${MOCK_HIVEMOOT_WATCH_OUTPUT:-}" ]; then
+      printf '%s\n' "${MOCK_HIVEMOOT_WATCH_OUTPUT}"
+    fi
+    ;;
+
+  ack)
+    ack_key="${1:-}"
+    shift || true
+    state_file=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --state-file)
+          shift
+          state_file="${1:-}"
+          ;;
+      esac
+      shift || true
+    done
+    printf '%s|%s\n' "$ack_key" "$state_file" >> "${state_dir}/ack.log"
+    if [ "${MOCK_HIVEMOOT_ACK_FAIL:-0}" = "1" ]; then
+      exit 1
+    fi
+    ;;
+
+  *)
+    echo "unexpected hivemoot invocation: ${cmd} $*" >&2
+    exit 1
+    ;;
+esac
+EOF_MOCK
+
+  chmod +x "${mock_bin}/hivemoot"
+}
+
 run_success_case() {
   local repo_root="$1"
   local case_dir="$2"
@@ -270,6 +324,62 @@ run_failure_case() {
   echo "PASS: failure case records failed sentinel with exit code"
 }
 
+run_mentions_case() {
+  local repo_root="$1"
+  local case_dir="$2"
+  local run_log=""
+  local mention_summary_count=""
+  local done_count=""
+  local ack_log=""
+  local expected_ack_key="thread-123:2026-02-20T03:44:00Z"
+  local expected_state_file="${case_dir}/workspace/watch-state/worker.json"
+  local -a done_files=()
+
+  mkdir -p "$case_dir"
+  setup_mock_docker "${case_dir}/mock-bin"
+  setup_mock_hivemoot "${case_dir}/mock-bin"
+
+  env -i \
+    PATH="${case_dir}/mock-bin:${PATH}" \
+    HOME="${case_dir}/home" \
+    MOCK_DOCKER_STATE_DIR="${case_dir}/mock-state" \
+    MOCK_DOCKER_WAIT_SLEEP_SECS="0" \
+    MOCK_HIVEMOOT_STATE_DIR="${case_dir}/hivemoot-state" \
+    MOCK_HIVEMOOT_WATCH_OUTPUT='{"threadId":"thread-123","number":42,"title":"Controller mention","author":"hivemoot","body":"@hivemoot-guard please take a look","url":"https://github.com/hivemoot/hivemoot-agent/issues/130#issuecomment-1","timestamp":"2026-02-20T03:44:00Z"}' \
+    TARGET_REPO="owner/repo" \
+    CONTROLLER_RUN_MODE="once" \
+    CONTROLLER_MAX_WORKERS="1" \
+    CONTROLLER_WORKSPACE_ROOT="${case_dir}/workspace" \
+    WORKER_IMAGE="hivemoot-agent:test" \
+    WATCH_MENTIONS="1" \
+    WATCH_POLL_INTERVAL="30" \
+    AGENT_ID_01="worker" \
+    AGENT_GITHUB_TOKEN_01="token-1" \
+    AGENT_TIMEOUT_SECONDS="120" \
+    PERIODIC_INTERVAL_SECS="60" \
+    PERIODIC_JITTER_SECS="0" \
+    bash "${repo_root}/scripts/controller.sh"
+
+  run_log="${case_dir}/mock-state/docker-run.log"
+  [ -f "$run_log" ] || fail "missing docker run log in mention case"
+  assert_file_contains "$run_log" "-e AGENT_SESSION_KEY=mention-thread:thread-123"
+
+  mention_summary_count="$(grep -R --include=summary -F 'trigger=mention' "${case_dir}/workspace/workspaces" | wc -l | tr -d '[:space:]')"
+  assert_eq "1" "$mention_summary_count" "expected one mention-triggered job summary"
+
+  shopt -s nullglob
+  done_files=("${case_dir}/workspace"/queue/*.done)
+  shopt -u nullglob
+  done_count="${#done_files[@]}"
+  assert_eq "1" "$done_count" "expected one processed mention trigger file"
+
+  ack_log="${case_dir}/hivemoot-state/ack.log"
+  [ -f "$ack_log" ] || fail "missing ack log in mention case"
+  assert_file_contains "$ack_log" "${expected_ack_key}|${expected_state_file}"
+
+  echo "PASS: mention case queues trigger, forwards session key, and defers ack"
+}
+
 run_shutdown_signal_case() {
   local repo_root="$1"
   local case_dir="$2"
@@ -341,5 +451,6 @@ trap 'rm -rf "$tmpdir"' EXIT
 echo "Running controller script checks"
 run_success_case "$repo_root" "${tmpdir}/success"
 run_failure_case "$repo_root" "${tmpdir}/failure"
+run_mentions_case "$repo_root" "${tmpdir}/mentions"
 run_shutdown_signal_case "$repo_root" "${tmpdir}/shutdown"
 echo "PASS: controller script checks"
