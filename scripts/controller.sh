@@ -337,6 +337,31 @@ write_trigger_file() {
   mv "$temp_file" "$trigger_file"
 }
 
+queue_has_ack_key() {
+  local ack_key="$1"
+  local existing_file=""
+  local existing_ack_key=""
+  local -a existing_files=()
+
+  if [ -z "$ack_key" ]; then
+    return 1
+  fi
+
+  shopt -s nullglob
+  existing_files=("${queue_root}"/*.trigger.json "${queue_root}"/*.processing "${queue_root}"/*.done)
+  shopt -u nullglob
+
+  for existing_file in "${existing_files[@]}"; do
+    [ -f "$existing_file" ] || continue
+    existing_ack_key="$(jq -r '.ack_key // empty' "$existing_file" 2>/dev/null || true)"
+    if [ "$existing_ack_key" = "$ack_key" ]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 enqueue_watch_event() {
   local agent_id="$1"
   local state_file="$2"
@@ -383,6 +408,11 @@ enqueue_watch_event() {
 
   if [ -n "$thread_id" ] && [ -n "$timestamp" ]; then
     ack_key="${thread_id}:${timestamp}"
+  fi
+
+  if queue_has_ack_key "$ack_key"; then
+    log "${agent_id}: duplicate mention suppressed (ack_key=${ack_key})"
+    return 0
   fi
 
   if [ -n "$thread_id" ]; then
@@ -523,6 +553,53 @@ ack_mention() {
 
   log "Ack failed: agent=${agent_id} key=${ack_key}"
   return 1
+}
+
+file_mtime_epoch() {
+  local path="$1"
+  local fallback="$2"
+  local mtime=""
+
+  if mtime="$(stat -c %Y "$path" 2>/dev/null)"; then
+    printf '%s\n' "$mtime"
+    return 0
+  fi
+
+  if mtime="$(stat -f %m "$path" 2>/dev/null)"; then
+    printf '%s\n' "$mtime"
+    return 0
+  fi
+
+  printf '%s\n' "$fallback"
+}
+
+recover_orphaned_triggers() {
+  local now=0
+  local mtime=0
+  local age_secs=0
+  local processing_file=""
+  local recovered_file=""
+  local -a processing_files=()
+
+  now="$(date +%s)"
+
+  shopt -s nullglob
+  processing_files=("${queue_root}"/*.processing)
+  shopt -u nullglob
+
+  for processing_file in "${processing_files[@]}"; do
+    [ -f "$processing_file" ] || continue
+    mtime="$(file_mtime_epoch "$processing_file" "$now")"
+    age_secs=$((now - mtime))
+    if [ "$age_secs" -le "$agent_timeout_seconds" ]; then
+      continue
+    fi
+
+    recovered_file="${processing_file%.processing}.trigger.json"
+    if mv "$processing_file" "$recovered_file" 2>/dev/null; then
+      log "Recovered orphaned trigger: $(basename "$processing_file")"
+    fi
+  done
 }
 
 process_queue() {
@@ -910,6 +987,7 @@ queue_periodic_cycle() {
 }
 
 run_once_mode() {
+  recover_orphaned_triggers
   queue_periodic_cycle
 
   if [ "$watch_mentions" = "1" ]; then
@@ -922,6 +1000,8 @@ run_loop_mode() {
   local next_periodic_at=0
   local now=0
   local delay=0
+
+  recover_orphaned_triggers
 
   if [ "$watch_mentions" = "1" ]; then
     start_mention_watchers

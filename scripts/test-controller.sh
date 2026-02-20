@@ -380,6 +380,148 @@ run_mentions_case() {
   echo "PASS: mention case queues trigger, forwards session key, and defers ack"
 }
 
+run_mentions_dedup_case() {
+  local repo_root="$1"
+  local case_dir="$2"
+  local run_log=""
+  local controller_log=""
+  local mention_summary_count=""
+  local done_count=""
+  local ack_log=""
+  local ack_count=""
+  local watch_output=""
+  local expected_ack_key="thread-dup:2026-02-20T04:01:00Z"
+  local expected_state_file="${case_dir}/workspace/watch-state/worker.json"
+  local -a done_files=()
+
+  mkdir -p "$case_dir"
+  setup_mock_docker "${case_dir}/mock-bin"
+  setup_mock_hivemoot "${case_dir}/mock-bin"
+
+  watch_output=$'{"threadId":"thread-dup","number":77,"title":"Duplicate mention","author":"hivemoot","body":"@hivemoot-guard ping","url":"https://github.com/hivemoot/hivemoot-agent/pull/132#issuecomment-1","timestamp":"2026-02-20T04:01:00Z"}\n{"threadId":"thread-dup","number":77,"title":"Duplicate mention","author":"hivemoot","body":"@hivemoot-guard ping","url":"https://github.com/hivemoot/hivemoot-agent/pull/132#issuecomment-1","timestamp":"2026-02-20T04:01:00Z"}'
+  controller_log="${case_dir}/controller.log"
+
+  env -i \
+    PATH="${case_dir}/mock-bin:${PATH}" \
+    HOME="${case_dir}/home" \
+    MOCK_DOCKER_STATE_DIR="${case_dir}/mock-state" \
+    MOCK_DOCKER_WAIT_SLEEP_SECS="0" \
+    MOCK_HIVEMOOT_STATE_DIR="${case_dir}/hivemoot-state" \
+    MOCK_HIVEMOOT_WATCH_OUTPUT="${watch_output}" \
+    TARGET_REPO="owner/repo" \
+    CONTROLLER_RUN_MODE="once" \
+    CONTROLLER_MAX_WORKERS="1" \
+    CONTROLLER_WORKSPACE_ROOT="${case_dir}/workspace" \
+    WORKER_IMAGE="hivemoot-agent:test" \
+    WATCH_MENTIONS="1" \
+    WATCH_POLL_INTERVAL="30" \
+    AGENT_ID_01="worker" \
+    AGENT_GITHUB_TOKEN_01="token-1" \
+    AGENT_TIMEOUT_SECONDS="120" \
+    PERIODIC_INTERVAL_SECS="60" \
+    PERIODIC_JITTER_SECS="0" \
+    bash "${repo_root}/scripts/controller.sh" >"$controller_log" 2>&1
+
+  run_log="${case_dir}/mock-state/docker-run.log"
+  [ -f "$run_log" ] || fail "missing docker run log in mention dedup case"
+  assert_file_contains "$run_log" "-e AGENT_SESSION_KEY=mention-thread:thread-dup"
+
+  mention_summary_count="$(grep -R --include=summary -F 'trigger=mention' "${case_dir}/workspace/workspaces" | wc -l | tr -d '[:space:]')"
+  assert_eq "1" "$mention_summary_count" "expected one mention-triggered job summary after duplicate suppression"
+
+  shopt -s nullglob
+  done_files=("${case_dir}/workspace"/queue/*.done)
+  shopt -u nullglob
+  done_count="${#done_files[@]}"
+  assert_eq "1" "$done_count" "expected one processed mention trigger file after duplicate suppression"
+
+  ack_log="${case_dir}/hivemoot-state/ack.log"
+  [ -f "$ack_log" ] || fail "missing ack log in mention dedup case"
+  ack_count="$(wc -l < "$ack_log" | tr -d '[:space:]')"
+  assert_eq "1" "$ack_count" "expected one ack call after duplicate suppression"
+  assert_file_contains "$ack_log" "${expected_ack_key}|${expected_state_file}"
+  assert_file_contains "$controller_log" "duplicate mention suppressed (ack_key=${expected_ack_key})"
+
+  echo "PASS: duplicate mention events are suppressed by ack_key"
+}
+
+run_orphan_recovery_case() {
+  local repo_root="$1"
+  local case_dir="$2"
+  local queue_file=""
+  local run_log=""
+  local controller_log=""
+  local mention_summary_count=""
+  local ack_log=""
+  local expected_ack_key="thread-orphan:2026-02-20T04:11:00Z"
+  local expected_state_file="${case_dir}/workspace/watch-state/worker.json"
+  local -a processing_files=()
+  local -a trigger_files=()
+  local -a done_files=()
+
+  mkdir -p "${case_dir}/workspace/queue"
+  setup_mock_docker "${case_dir}/mock-bin"
+  setup_mock_hivemoot "${case_dir}/mock-bin"
+
+  queue_file="${case_dir}/workspace/queue/orphan.processing"
+  cat > "$queue_file" <<EOF_TRIGGER
+{
+  "trigger_type": "mention",
+  "repo": "owner/repo",
+  "agent_id": "worker",
+  "extra_prompt": "Recovered orphan trigger",
+  "ack_key": "${expected_ack_key}",
+  "state_file": "${expected_state_file}",
+  "session_key": "mention-thread:thread-orphan"
+}
+EOF_TRIGGER
+  sleep 2
+  controller_log="${case_dir}/controller.log"
+
+  env -i \
+    PATH="${case_dir}/mock-bin:${PATH}" \
+    HOME="${case_dir}/home" \
+    MOCK_DOCKER_STATE_DIR="${case_dir}/mock-state" \
+    MOCK_DOCKER_WAIT_SLEEP_SECS="0" \
+    MOCK_HIVEMOOT_STATE_DIR="${case_dir}/hivemoot-state" \
+    TARGET_REPO="owner/repo" \
+    CONTROLLER_RUN_MODE="once" \
+    CONTROLLER_MAX_WORKERS="1" \
+    CONTROLLER_WORKSPACE_ROOT="${case_dir}/workspace" \
+    WORKER_IMAGE="hivemoot-agent:test" \
+    WATCH_MENTIONS="1" \
+    WATCH_POLL_INTERVAL="30" \
+    AGENT_ID_01="worker" \
+    AGENT_GITHUB_TOKEN_01="token-1" \
+    AGENT_TIMEOUT_SECONDS="1" \
+    PERIODIC_INTERVAL_SECS="60" \
+    PERIODIC_JITTER_SECS="0" \
+    bash "${repo_root}/scripts/controller.sh" >"$controller_log" 2>&1
+
+  run_log="${case_dir}/mock-state/docker-run.log"
+  [ -f "$run_log" ] || fail "missing docker run log in orphan recovery case"
+  assert_file_contains "$run_log" "-e AGENT_SESSION_KEY=mention-thread:thread-orphan"
+
+  mention_summary_count="$(grep -R --include=summary -F 'trigger=mention' "${case_dir}/workspace/workspaces" | wc -l | tr -d '[:space:]')"
+  assert_eq "1" "$mention_summary_count" "expected recovered orphan trigger to execute once"
+
+  shopt -s nullglob
+  processing_files=("${case_dir}/workspace"/queue/*.processing)
+  trigger_files=("${case_dir}/workspace"/queue/*.trigger.json)
+  done_files=("${case_dir}/workspace"/queue/*.done)
+  shopt -u nullglob
+  assert_eq "0" "${#processing_files[@]}" "expected no stale processing files after recovery"
+  assert_eq "0" "${#trigger_files[@]}" "expected no pending trigger files after recovery"
+  assert_eq "1" "${#done_files[@]}" "expected recovered trigger to complete"
+
+  ack_log="${case_dir}/hivemoot-state/ack.log"
+  [ -f "$ack_log" ] || fail "missing ack log in orphan recovery case"
+  assert_file_contains "$ack_log" "${expected_ack_key}|${expected_state_file}"
+  assert_file_contains "$controller_log" "Recovered orphaned trigger: orphan.processing"
+
+  echo "PASS: stale processing triggers are recovered and executed"
+}
+
 run_shutdown_signal_case() {
   local repo_root="$1"
   local case_dir="$2"
@@ -452,5 +594,7 @@ echo "Running controller script checks"
 run_success_case "$repo_root" "${tmpdir}/success"
 run_failure_case "$repo_root" "${tmpdir}/failure"
 run_mentions_case "$repo_root" "${tmpdir}/mentions"
+run_mentions_dedup_case "$repo_root" "${tmpdir}/mentions-dedup"
+run_orphan_recovery_case "$repo_root" "${tmpdir}/orphan-recovery"
 run_shutdown_signal_case "$repo_root" "${tmpdir}/shutdown"
 echo "PASS: controller script checks"
