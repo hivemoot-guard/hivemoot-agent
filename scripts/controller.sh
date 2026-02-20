@@ -339,6 +339,7 @@ write_trigger_file() {
 
 queue_has_ack_key() {
   local ack_key="$1"
+  local ack_key_marker=""
   local existing_file=""
   local existing_ack_key=""
   local -a existing_files=()
@@ -346,6 +347,7 @@ queue_has_ack_key() {
   if [ -z "$ack_key" ]; then
     return 1
   fi
+  ack_key_marker="\"ack_key\": \"${ack_key}\""
 
   shopt -s nullglob
   existing_files=("${queue_root}"/*.trigger.json "${queue_root}"/*.processing "${queue_root}"/*.done)
@@ -353,8 +355,30 @@ queue_has_ack_key() {
 
   for existing_file in "${existing_files[@]}"; do
     [ -f "$existing_file" ] || continue
+    # Fast-path: skip jq parse for files that cannot contain this ack key.
+    if ! grep -Fq "$ack_key_marker" "$existing_file"; then
+      continue
+    fi
     existing_ack_key="$(jq -r '.ack_key // empty' "$existing_file" 2>/dev/null || true)"
     if [ "$existing_ack_key" = "$ack_key" ]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+processing_file_is_active() {
+  local processing_file="$1"
+  local pid=""
+  local tracked_file=""
+
+  for pid in "${running_pids[@]}"; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      continue
+    fi
+    tracked_file="${pid_to_processing_file[$pid]:-}"
+    if [ "$tracked_file" = "$processing_file" ]; then
       return 0
     fi
   done
@@ -579,9 +603,11 @@ recover_orphaned_triggers() {
   local age_secs=0
   local processing_file=""
   local recovered_file=""
+  local max_age_secs=0
   local -a processing_files=()
 
   now="$(date +%s)"
+  max_age_secs=$((agent_timeout_seconds + orphan_recovery_grace_secs))
 
   shopt -s nullglob
   processing_files=("${queue_root}"/*.processing)
@@ -589,9 +615,12 @@ recover_orphaned_triggers() {
 
   for processing_file in "${processing_files[@]}"; do
     [ -f "$processing_file" ] || continue
+    if processing_file_is_active "$processing_file"; then
+      continue
+    fi
     mtime="$(file_mtime_epoch "$processing_file" "$now")"
     age_secs=$((now - mtime))
-    if [ "$age_secs" -le "$agent_timeout_seconds" ]; then
+    if [ "$age_secs" -le "$max_age_secs" ]; then
       continue
     fi
 
@@ -600,6 +629,50 @@ recover_orphaned_triggers() {
       log "Recovered orphaned trigger: $(basename "$processing_file")"
     fi
   done
+}
+
+prune_queue_artifacts() {
+  local now=0
+  local mtime=0
+  local age_secs=0
+  local artifact_file=""
+  local -a artifact_files=()
+
+  if [ "$queue_artifact_ttl_secs" -le 0 ]; then
+    return 0
+  fi
+
+  now="$(date +%s)"
+
+  shopt -s nullglob
+  artifact_files=("${queue_root}"/*.done "${queue_root}"/*.failed)
+  shopt -u nullglob
+
+  for artifact_file in "${artifact_files[@]}"; do
+    [ -f "$artifact_file" ] || continue
+    mtime="$(file_mtime_epoch "$artifact_file" "$now")"
+    age_secs=$((now - mtime))
+    if [ "$age_secs" -le "$queue_artifact_ttl_secs" ]; then
+      continue
+    fi
+    rm -f "$artifact_file" 2>/dev/null || true
+  done
+}
+
+run_queue_maintenance() {
+  local force_run="${1:-0}"
+  local now=0
+
+  if [ "$force_run" -ne 1 ] && [ "$queue_maintenance_interval_secs" -gt 0 ] && [ "$last_queue_maintenance_epoch" -gt 0 ]; then
+    now="$(date +%s)"
+    if [ $((now - last_queue_maintenance_epoch)) -lt "$queue_maintenance_interval_secs" ]; then
+      return 0
+    fi
+  fi
+
+  recover_orphaned_triggers
+  prune_queue_artifacts
+  last_queue_maintenance_epoch="$(date +%s)"
 }
 
 process_queue() {
@@ -1011,7 +1084,7 @@ queue_periodic_cycle() {
 }
 
 run_once_mode() {
-  recover_orphaned_triggers
+  run_queue_maintenance 1
   queue_periodic_cycle
 
   if [ "$watch_mentions" = "1" ]; then
@@ -1025,7 +1098,7 @@ run_loop_mode() {
   local now=0
   local delay=0
 
-  recover_orphaned_triggers
+  run_queue_maintenance 1
 
   if [ "$watch_mentions" = "1" ]; then
     start_mention_watchers
@@ -1041,6 +1114,7 @@ run_loop_mode() {
       log "Next periodic cycle in ${delay}s"
     fi
 
+    run_queue_maintenance 0
     process_queue
     reap_finished_jobs
 
@@ -1081,6 +1155,9 @@ periodic_interval="${PERIODIC_INTERVAL_SECS:-3600}"
 periodic_jitter="${PERIODIC_JITTER_SECS:-300}"
 watch_mentions="${WATCH_MENTIONS:-0}"
 watch_poll_interval="${WATCH_POLL_INTERVAL:-300}"
+orphan_recovery_grace_secs="${ORPHAN_RECOVERY_GRACE_SECS:-0}"
+queue_artifact_ttl_secs="${QUEUE_ARTIFACT_TTL_SECS:-604800}"
+queue_maintenance_interval_secs="${QUEUE_MAINTENANCE_INTERVAL_SECS:-60}"
 shutdown_grace_secs="${CONTROLLER_SHUTDOWN_GRACE_SECS:-30}"
 workspace_root="${CONTROLLER_WORKSPACE_ROOT:-${WORKSPACE_ROOT:-$(pwd)/data/controller}}"
 shutdown_flag_file="${workspace_root}/shutdown.requested"
@@ -1101,6 +1178,7 @@ controller_instance_id="$(date +%s)-$$"
 shutdown_requested=0
 completed_jobs=0
 failed_jobs=0
+last_queue_maintenance_epoch=0
 
 declare -a temp_token_files=()
 declare -a running_pids=()
@@ -1136,6 +1214,9 @@ require_positive_integer AGENT_TIMEOUT_SECONDS "$agent_timeout_seconds"
 require_positive_integer CONTROLLER_SHUTDOWN_GRACE_SECS "$shutdown_grace_secs"
 require_positive_integer PERIODIC_INTERVAL_SECS "$periodic_interval"
 require_non_negative_integer PERIODIC_JITTER_SECS "$periodic_jitter"
+require_non_negative_integer ORPHAN_RECOVERY_GRACE_SECS "$orphan_recovery_grace_secs"
+require_non_negative_integer QUEUE_ARTIFACT_TTL_SECS "$queue_artifact_ttl_secs"
+require_non_negative_integer QUEUE_MAINTENANCE_INTERVAL_SECS "$queue_maintenance_interval_secs"
 if [ "$watch_mentions" = "1" ]; then
   require_positive_integer WATCH_POLL_INTERVAL "$watch_poll_interval"
 fi
