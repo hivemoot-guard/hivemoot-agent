@@ -268,7 +268,7 @@ run_success_case() {
   assert_file_contains "$run_log" "-e HIVEMOOT_CLI_UPDATE=skip"
   assert_file_contains "$run_log" "-e GIT_CLONE_DEPTH=1"
 
-  cache_env_count="$(grep -F -- '-e GIT_CACHE_DIR=/workspace/.git-cache' "$run_log" | wc -l | tr -d '[:space:]')"
+  cache_env_count="$(grep -Fc -- '-e GIT_CACHE_DIR=/workspace/.git-cache' "$run_log")"
   assert_eq "2" "$cache_env_count" "expected shared cache dir to be identical across workers"
 
   shopt -s nullglob
