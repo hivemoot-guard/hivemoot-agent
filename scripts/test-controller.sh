@@ -224,6 +224,7 @@ EOF_MOCK
 run_success_case() {
   local repo_root="$1"
   local case_dir="$2"
+  local cache_env_count=""
 
   mkdir -p "$case_dir"
   setup_mock_docker "${case_dir}/mock-bin"
@@ -259,11 +260,16 @@ run_success_case() {
   assert_file_contains "$run_log" "--read-only"
   assert_file_contains "$run_log" "--tmpfs /tmp:size=2g,mode=1777"
   assert_file_contains "$run_log" "--tmpfs /usr/local/share/npm-global:size=1g"
+  assert_file_contains "$run_log" "-v ${case_dir}/workspace/.git-cache:/workspace/.git-cache"
   assert_file_contains "$run_log" "-e RUN_MODE=once"
   assert_file_contains "$run_log" "-e TARGET_REPO=owner/repo"
+  assert_file_contains "$run_log" "-e GIT_CACHE_DIR=/workspace/.git-cache"
   assert_file_contains "$run_log" "-e JOB_ID="
   assert_file_contains "$run_log" "-e HIVEMOOT_CLI_UPDATE=skip"
   assert_file_contains "$run_log" "-e GIT_CLONE_DEPTH=1"
+
+  cache_env_count="$(grep -F -- '-e GIT_CACHE_DIR=/workspace/.git-cache' "$run_log" | wc -l | tr -d '[:space:]')"
+  assert_eq "2" "$cache_env_count" "expected shared cache dir to be identical across workers"
 
   shopt -s nullglob
   status_files=("${case_dir}/workspace"/workspaces/*/.hivemoot/status)

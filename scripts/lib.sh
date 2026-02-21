@@ -310,7 +310,7 @@ seed_provider_auth() {
 # Args:
 #   target_repo   owner/repo form of the repository
 #   mirror_dir    path for the bare mirror (e.g. /workspace/.git-cache/owner/repo/mirror.git)
-#   lock_dir      directory for flock lock files (e.g. /tmp/hivemoot-git-cache)
+#   lock_dir      directory for flock lock files (e.g. /workspace/.git-cache/locks)
 #   clone_dir     destination for the working clone
 #   clone_depth   shallow depth (0 = full clone)
 #   askpass       path to a GIT_ASKPASS script that emits credentials

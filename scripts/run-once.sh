@@ -269,6 +269,7 @@ auth_mode="${AGENT_AUTH_MODE:-auto}"
 hivemoot_buzz_role="${HIVEMOOT_BUZZ_ROLE:-}"
 target_repo="${TARGET_REPO:-}"
 workspace_root="${WORKSPACE_ROOT:-/workspace}"
+git_cache_dir="${GIT_CACHE_DIR:-${workspace_root}/.git-cache}"
 clone_depth="${GIT_CLONE_DEPTH:-50}"
 shared_clone_cache="${SHARED_CLONE_CACHE:-1}"
 prompt_file="${AGENT_PROMPT_FILE:-/opt/hivemoot-agent/prompts/default.md}"
@@ -321,6 +322,15 @@ if ! effective_auth_mode="$(resolve_effective_auth_mode "$provider" "$auth_mode"
 fi
 
 validate_workspace_root "$workspace_root"
+if [ "${shared_clone_cache}" = "1" ]; then
+  case "$git_cache_dir" in
+    /*) ;;
+    *)
+      echo "GIT_CACHE_DIR must be an absolute path" >&2
+      exit 1
+      ;;
+  esac
+fi
 
 # When REPO_DIR/LOG_DIR are set externally (run-multi.sh, run-loop.sh),
 # isolation is handled by the caller. Otherwise, generate a JOB_ID to
@@ -590,10 +600,11 @@ EOF
     local fresh_clone_ok=0
 
     if [ "${shared_clone_cache}" = "1" ]; then
-      local mirror_dir="${workspace_root}/.git-cache/${target_repo}/mirror.git"
+      local mirror_dir="${git_cache_dir}/${target_repo}/mirror.git"
+      local lock_dir="${git_cache_dir}/locks"
       log "Cloning https://github.com/${target_repo}.git via shared cache (depth=${depth_label})"
       if clone_with_reference_cache \
-          "$target_repo" "$mirror_dir" "/tmp/hivemoot-git-cache" \
+          "$target_repo" "$mirror_dir" "$lock_dir" \
           "$repo_dir" "$clone_depth" "$askpass" "$github_token"; then
         fresh_clone_ok=1
       else

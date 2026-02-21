@@ -45,6 +45,14 @@ assert_fails_with \
   env TARGET_REPO=owner/repo WORKSPACE_ROOT=relative AGENT_ID_01=worker AGENT_GITHUB_TOKEN_01=dummy bash scripts/run-loop.sh
 
 assert_fails_with \
+  "GIT_CACHE_DIR must be an absolute path" \
+  env TARGET_REPO=owner/repo GIT_CACHE_DIR=relative bash scripts/run-once.sh
+
+assert_fails_with \
+  "GIT_CACHE_DIR must be an absolute path" \
+  env TARGET_REPO=owner/repo GIT_CACHE_DIR=relative AGENT_ID_01=worker AGENT_GITHUB_TOKEN_01=dummy bash scripts/run-multi.sh
+
+assert_fails_with \
   "Invalid agent id: ." \
   env TARGET_REPO=owner/repo AGENT_ID_01=. AGENT_GITHUB_TOKEN_01=dummy bash scripts/run-multi.sh
 
