@@ -55,4 +55,17 @@ assert_fails_with \
   "Invalid TARGET_REPO: not-a-repo. Expected owner/repo." \
   env -u WATCH_MENTIONS TARGET_REPO=not-a-repo bash scripts/run-loop.sh
 
+# Path-traversal rejection: dot-leading components must be rejected
+assert_fails_with \
+  "Invalid TARGET_REPO: ../evil. Expected owner/repo." \
+  env TARGET_REPO=../evil bash scripts/run-once.sh
+
+assert_fails_with \
+  "Invalid TARGET_REPO: owner/... Expected owner/repo." \
+  env TARGET_REPO=owner/.. bash scripts/run-once.sh
+
+assert_fails_with \
+  "Invalid TARGET_REPO: ./repo. Expected owner/repo." \
+  env TARGET_REPO=./repo bash scripts/run-once.sh
+
 echo "PASS: TARGET_REPO validation checks"

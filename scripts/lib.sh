@@ -130,7 +130,7 @@ validate_target_repo() {
     exit 1
   fi
 
-  if ! printf '%s' "$target_repo" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+  if ! printf '%s' "$target_repo" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$'; then
     echo "Invalid TARGET_REPO: ${target_repo}. Expected owner/repo." >&2
     exit 1
   fi
