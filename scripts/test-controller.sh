@@ -766,6 +766,81 @@ run_shutdown_signal_case() {
   echo "PASS: shutdown blocks queued launches after signal (controller_exit=${controller_status})"
 }
 
+run_same_agent_concurrent_case() {
+  local repo_root="$1"
+  local case_dir="$2"
+  local run_log=""
+  local controller_log=""
+  local launch_count=""
+  local mention_trigger_file=""
+  local -a requeued=()
+
+  mkdir -p "${case_dir}/workspace/queue"
+  setup_mock_docker "${case_dir}/mock-bin"
+  setup_mock_hivemoot "${case_dir}/mock-bin"
+
+  # Pre-write a mention trigger for the same agent that will receive
+  # the periodic trigger. The controller will attempt to launch it via
+  # process_queue() while the periodic job's subshell is still alive.
+  mention_trigger_file="${case_dir}/workspace/queue/mention-concurrent.trigger.json"
+  cat > "$mention_trigger_file" <<EOF_TRIGGER
+{
+  "trigger_type": "mention",
+  "repo": "owner/repo",
+  "agent_id": "worker",
+  "extra_prompt": "Concurrent mention test",
+  "ack_key": "thread-concurrent:2026-02-23T00:00:00Z",
+  "state_file": "${case_dir}/workspace/watch-state/worker.json",
+  "session_key": "mention-thread:thread-concurrent"
+}
+EOF_TRIGGER
+
+  controller_log="${case_dir}/controller.log"
+
+  # MAX_WORKERS=2 ensures the global slot count is not the reason the
+  # mention is deferred — only the per-agent guard should block it.
+  # MOCK_DOCKER_WAIT_SLEEP_SECS=2 keeps the periodic subshell alive long
+  # enough for process_queue() to run while it is still in running_pids.
+  env -i \
+    PATH="${case_dir}/mock-bin:${PATH}" \
+    HOME="${case_dir}/home" \
+    MOCK_DOCKER_STATE_DIR="${case_dir}/mock-state" \
+    MOCK_DOCKER_WAIT_SLEEP_SECS="2" \
+    MOCK_HIVEMOOT_STATE_DIR="${case_dir}/hivemoot-state" \
+    TARGET_REPO="owner/repo" \
+    CONTROLLER_RUN_MODE="once" \
+    CONTROLLER_MAX_WORKERS="2" \
+    CONTROLLER_WORKSPACE_ROOT="${case_dir}/workspace" \
+    WORKER_IMAGE="hivemoot-agent:test" \
+    WATCH_MENTIONS="1" \
+    WATCH_POLL_INTERVAL="30" \
+    AGENT_ID_01="worker" \
+    AGENT_GITHUB_TOKEN_01="token-1" \
+    AGENT_TIMEOUT_SECONDS="120" \
+    PERIODIC_INTERVAL_SECS="60" \
+    PERIODIC_JITTER_SECS="0" \
+    bash "${repo_root}/scripts/controller.sh" >"$controller_log" 2>&1
+
+  run_log="${case_dir}/mock-state/docker-run.log"
+  [ -f "$run_log" ] || fail "missing docker run log in same-agent-concurrent case"
+
+  launch_count="$(wc -l < "$run_log" | tr -d '[:space:]')"
+  assert_eq "1" "$launch_count" "per-agent guard should prevent second launch for same agent"
+
+  assert_file_contains "$controller_log" "already running"
+  assert_file_contains "$controller_log" "deferring mention trigger"
+
+  # Mention trigger must be re-queued as .trigger.json, not lost or marked done.
+  shopt -s nullglob
+  requeued=("${case_dir}/workspace/queue/"*.trigger.json)
+  shopt -u nullglob
+  if [ "${#requeued[@]}" -ne 1 ]; then
+    fail "expected mention trigger to be re-queued as .trigger.json (found ${#requeued[@]})"
+  fi
+
+  echo "PASS: per-agent guard defers concurrent trigger and re-queues mention"
+}
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmpdir="$(mktemp -d "${repo_root}/.tmp-controller-test.XXXXXX")"
 trap 'rm -rf "$tmpdir"' EXIT
@@ -779,4 +854,5 @@ run_mentions_dedup_case "$repo_root" "${tmpdir}/mentions-dedup"
 run_orphan_recovery_case "$repo_root" "${tmpdir}/orphan-recovery"
 run_mentions_retry_after_failure_case "$repo_root" "${tmpdir}/mentions-retry"
 run_shutdown_signal_case "$repo_root" "${tmpdir}/shutdown"
+run_same_agent_concurrent_case "$repo_root" "${tmpdir}/same-agent-concurrent"
 echo "PASS: controller script checks"
