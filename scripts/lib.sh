@@ -222,6 +222,92 @@ load_slot_token() {
   printf '%s' "$token"
 }
 
+preflight_check_provider_auth() {
+  local provider="$1"
+  local auth_mode="${2:-auto}"
+  local failures=0
+
+  # Provider auth check
+  case "$provider" in
+    codex)
+      local resolved="$auth_mode"
+      [ "$resolved" = "auto" ] && resolved=$( [ -n "${OPENAI_API_KEY:-}" ] && echo "api_key" || echo "subscription" )
+      if [ "$resolved" = "api_key" ] && [ -z "${OPENAI_API_KEY:-}" ]; then
+        echo "Pre-flight: OPENAI_API_KEY missing for codex + api_key mode." >&2
+        failures=$((failures + 1))
+      fi
+      ;;
+    gemini)
+      local resolved="$auth_mode"
+      [ "$resolved" = "auto" ] && resolved=$( { [ -n "${GOOGLE_API_KEY:-}" ] || [ -n "${GEMINI_API_KEY:-}" ]; } && echo "api_key" || echo "subscription" )
+      if [ "$resolved" = "api_key" ] && [ -z "${GOOGLE_API_KEY:-}" ] && [ -z "${GEMINI_API_KEY:-}" ]; then
+        echo "Pre-flight: GOOGLE_API_KEY/GEMINI_API_KEY missing for gemini + api_key mode." >&2
+        failures=$((failures + 1))
+      fi
+      ;;
+    claude)
+      local resolved="$auth_mode"
+      [ "$resolved" = "auto" ] && resolved=$( [ -n "${ANTHROPIC_API_KEY:-}" ] && echo "api_key" || echo "subscription" )
+      if [ "$resolved" = "api_key" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+        echo "Pre-flight: ANTHROPIC_API_KEY missing for claude + api_key mode." >&2
+        failures=$((failures + 1))
+      fi
+      ;;
+    kilo)
+      if [ -z "${KILOCODE_TOKEN:-}" ]; then
+        if [ -z "${KILO_PROVIDER:-}" ]; then
+          echo "Pre-flight: KILO_PROVIDER is required for kilo (unless KILOCODE_TOKEN is set for gateway mode)." >&2
+          failures=$((failures + 1))
+        else
+          case "${KILO_PROVIDER}" in
+            anthropic)
+              if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+                echo "Pre-flight: ANTHROPIC_API_KEY missing for KILO_PROVIDER=anthropic." >&2
+                failures=$((failures + 1))
+              fi
+              ;;
+            openai)
+              if [ -z "${OPENAI_API_KEY:-}" ]; then
+                echo "Pre-flight: OPENAI_API_KEY missing for KILO_PROVIDER=openai." >&2
+                failures=$((failures + 1))
+              fi
+              ;;
+            google)
+              if [ -z "${GOOGLE_API_KEY:-}" ] && [ -z "${GEMINI_API_KEY:-}" ]; then
+                echo "Pre-flight: GOOGLE_API_KEY/GEMINI_API_KEY missing for KILO_PROVIDER=google." >&2
+                failures=$((failures + 1))
+              fi
+              ;;
+            openrouter)
+              if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+                echo "Pre-flight: OPENROUTER_API_KEY missing for KILO_PROVIDER=openrouter." >&2
+                failures=$((failures + 1))
+              fi
+              ;;
+          esac
+        fi
+      fi
+      ;;
+    opencode)
+      if [ -n "${OPENCODE_PROVIDER:-}" ]; then
+        case "${OPENCODE_PROVIDER}" in
+          zai)
+            if [ -z "${ZAI_API_KEY:-}" ]; then
+              echo "Pre-flight: ZAI_API_KEY missing for OPENCODE_PROVIDER=zai." >&2
+              failures=$((failures + 1))
+            fi
+            ;;
+        esac
+      elif [ ! -f "/home/node/.local/share/opencode/auth.json" ]; then
+        echo "Pre-flight: OpenCode auth not configured. Set OPENCODE_PROVIDER + API key, or run: opencode auth login." >&2
+        failures=$((failures + 1))
+      fi
+      ;;
+  esac
+
+  return "$failures"
+}
+
 prepare_hivemoot_cli() {
   local update_mode="${HIVEMOOT_CLI_UPDATE:-auto}"
   local spec="@hivemoot-dev/cli@${HIVEMOOT_CLI_VERSION:-latest}"
@@ -370,4 +456,43 @@ init_agent_home() {
   # shellcheck disable=SC2016  # literal ${PATH} intended for .profile
   printf 'export PATH="/usr/local/share/npm-global/bin:${PATH}"\n' \
     > "$agent_home/.profile"
+}
+
+# Append a structured JSON event to an NDJSON events file.
+# Each call emits one JSON object per line (newline-delimited JSON).
+# Usage: log_event <events_file> <event_name> <agent_id> <run_id> <event_seq> [extra_fields]
+# extra_fields: raw JSON field list (no outer braces), e.g. '"duration_secs":42,"outcome":"success"'
+log_event() {
+  local events_file="$1"
+  local event_name="$2"
+  local agent_id="$3"
+  local run_id="$4"
+  local event_seq="$5"
+  local extra="${6:-}"
+  local ts
+  ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  if [ -n "$extra" ]; then
+    printf '{"event":"%s","agent_id":"%s","run_id":"%s","event_seq":%d,"timestamp":"%s",%s}\n' \
+      "$event_name" "$agent_id" "$run_id" "$event_seq" "$ts" "$extra" >> "$events_file"
+  else
+    printf '{"event":"%s","agent_id":"%s","run_id":"%s","event_seq":%d,"timestamp":"%s"}\n' \
+      "$event_name" "$agent_id" "$run_id" "$event_seq" "$ts" >> "$events_file"
+  fi
+}
+
+# Write an agent health snapshot atomically via temp-file + mv.
+# Readers never observe a partial write. Overwrites the previous snapshot.
+# Usage: write_health_snapshot <health_file> <agent_id> <run_id> <last_event> <consecutive_failures>
+write_health_snapshot() {
+  local health_file="$1"
+  local agent_id="$2"
+  local run_id="$3"
+  local last_event="$4"
+  local consecutive_failures="${5:-0}"
+  local ts
+  ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  local tmp_file="${health_file}.tmp.$$"
+  printf '{"agent_id":"%s","run_id":"%s","last_event":"%s","consecutive_failures":%d,"updated_at":"%s"}\n' \
+    "$agent_id" "$run_id" "$last_event" "$consecutive_failures" "$ts" > "$tmp_file"
+  mv "$tmp_file" "$health_file"
 }
