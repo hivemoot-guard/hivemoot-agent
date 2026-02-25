@@ -1095,9 +1095,15 @@ launch_job() {
     for running_pid in "${running_pids[@]}"; do
       if [ "${pid_to_agent[$running_pid]:-}" = "$agent_id" ]; then
         log "Agent ${agent_id} already running (job=${pid_to_job_id[$running_pid]}); deferring ${trigger_type} trigger"
-        if [ "$trigger_type" = "mention" ] && [ -n "$processing_file" ]; then
-          # Re-queue so process_queue() picks it up on the next cycle.
-          mv -f "$processing_file" "${processing_file%.processing}.trigger.json" 2>/dev/null || true
+        if [ -n "$processing_file" ]; then
+          if [ "$trigger_type" = "mention" ]; then
+            # Re-queue so process_queue() picks it up on the next cycle.
+            mv -f "$processing_file" "${processing_file%.processing}.trigger.json" 2>/dev/null || true
+          elif [ "$trigger_type" = "periodic" ]; then
+            # Periodic deferrals are intentionally dropped. Finalize the
+            # queue artifact immediately to avoid lingering .processing files.
+            mv -f "$processing_file" "${processing_file%.processing}.done" 2>/dev/null || true
+          fi
         fi
         # Periodic triggers re-fire on the next interval in loop mode.
         # In once mode there is no next interval in this process.
