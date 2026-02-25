@@ -1099,7 +1099,8 @@ launch_job() {
           # Re-queue so process_queue() picks it up on the next cycle.
           mv -f "$processing_file" "${processing_file%.processing}.trigger.json" 2>/dev/null || true
         fi
-        # Periodic triggers re-fire on the next interval; no re-queue needed.
+        # Periodic triggers re-fire on the next interval in loop mode.
+        # In once mode there is no next interval in this process.
         return 0
       fi
     done
