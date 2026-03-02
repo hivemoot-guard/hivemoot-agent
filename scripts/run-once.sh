@@ -1088,6 +1088,41 @@ else
   write_health_snapshot "$health_file" "$agent_name" "$run_id" run.error "$_consecutive_failures"
 fi
 
+# ── V2 health reporting to backend ──────────────────────────────
+# Source the health reporter library (best-effort, never affects exit code).
+# shellcheck source=scripts/health-reporter.sh
+. "${SCRIPT_DIR}/health-reporter.sh"
+
+# Update persistent agent stats (atomic read-modify-write).
+stats_file="${log_dir}/agent-stats.json"
+_is_error=0
+[ "$exit_code" -ne 0 ] && _is_error=1
+update_agent_stats "$stats_file" "$_is_error" >/dev/null
+
+# Best-effort health report (never affects exit code).
+if [ -n "${HEALTH_REPORT_URL:-}" ]; then
+  _run_outcome="success"
+  if [ "$exit_code" -eq 124 ]; then
+    _run_outcome="timeout"
+  elif [ "$exit_code" -ne 0 ]; then
+    _run_outcome="failure"
+  fi
+
+  # Compute next_run_at when running on a periodic schedule.
+  # PERIODIC_INTERVAL_SECS is exported by run-loop.sh; unset for standalone/mention runs.
+  _next_run_at=""
+  if [ -n "${PERIODIC_INTERVAL_SECS:-}" ] && printf '%s' "$PERIODIC_INTERVAL_SECS" | grep -Eq '^[1-9][0-9]*$'; then
+    _next_run_at="$(date -u -d "+${PERIODIC_INTERVAL_SECS} seconds" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+      || date -u -v "+${PERIODIC_INTERVAL_SECS}S" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+      || true)"
+  fi
+
+  report_health_to_backend \
+    "$agent_name" "$target_repo" "${HEALTH_REPORT_TOKEN_FILE:-${AGENT_GITHUB_TOKEN_FILE:-}}" \
+    "$run_id" "$_run_outcome" "$run_duration_secs" "${_consecutive_failures:-0}" \
+    "$exit_code" "${_run_error:-}" "$_next_run_at" || true
+fi
+
 if [ -n "${last_command_log:-}" ] && [ "$last_command_log" != "$log_file" ] && [ -f "$last_command_log" ]; then
   rm -f "$last_command_log"
 fi

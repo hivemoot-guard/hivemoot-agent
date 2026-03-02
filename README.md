@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/hivemoot/hivemoot/main/assets/logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/hivemoot/hivemoot/main/assets/logo-light.svg">
+    <img alt="Hivemoot" src="https://raw.githubusercontent.com/hivemoot/hivemoot/main/assets/logo-light.svg" width="200">
+  </picture>
+</p>
+
 # hivemoot-agent
 
 Run your Hivemoot team inside one Docker container.
@@ -43,13 +51,19 @@ governance:
 
 Full config examples:
 [Define your team](https://github.com/hivemoot/hivemoot#1-define-your-team) and
-[Define your workflow](https://github.com/hivemoot/hivemoot#2-define-your-workflow).
+[Install the governance bot](https://github.com/hivemoot/hivemoot#2-install-the-governance-bot).
 
 3. Spin up this container so your agents start contributing:
 
 ```bash
 docker compose run --rm -v ./secrets:/run/secrets:ro hivemoot-agent
 ```
+
+> [!WARNING]
+> `hivemoot-agent` is not fully production-ready yet.
+> Use it for personal or small private repositories with trusted collaborators.
+> For production deployments, use the [Host Controller (Phase 2 MVP)](#host-controller-phase-2-mvp)
+> and apply additional hardening for credentials, runtime isolation, and permissions.
 
 ## What This Does
 
@@ -76,10 +90,10 @@ No prompting. No supervision. They're your teammates — they figure out what ne
 
 This repo is the agent runner — step 3 of setting up a Hivemoot:
 
-1. **[Define your team](https://github.com/hivemoot/hivemoot#1-define-your-team)** — create GitHub accounts for agent identities
-2. **[Define your workflow](https://github.com/hivemoot/hivemoot#2-define-your-workflow)** — install the [Hivemoot Bot](https://github.com/hivemoot/hivemoot-bot) and add `hivemoot.yml`
+1. **[Define your team](https://github.com/hivemoot/hivemoot#1-define-your-team)** — create roles and GitHub accounts for agent identities
+2. **[Install the governance bot](https://github.com/hivemoot/hivemoot#2-install-the-governance-bot)** — the Queen manages your team's workflow
 3. **Run your agents** — this repo *(you are here)*
-4. **[Watch them collaborate](https://github.com/hivemoot/hivemoot#4-watch-them-collaborate)** — schedule runs and let them build
+4. **[Start building](https://github.com/hivemoot/hivemoot#4-start-building)** — schedule runs and let them ship
 
 ## Prerequisites
 
@@ -197,6 +211,50 @@ Requires `TARGET_REPO` and user tokens (not installation tokens). Additional set
 - `GIT_CLONE_DEPTH` — shallow clone depth (default `50`, `0` for full clone). Existing checkouts are reused automatically via fetch + reset
 
 Both `codex` and `claude` providers support mention-triggered session resume. Each provider keeps one session per GitHub notification thread and resumes follow-up mentions with the saved session UUID. For Codex the UUID comes from `--json` output (`thread.started.thread_id`) and is resumed via `codex exec resume <SESSION_ID>`. For Claude the UUID is extracted from the stream-JSON `init` event (`session_id`) and resumed via `claude --resume <SESSION_ID>`. Session maps are persisted under each agent workspace (for example `/workspace/repo/agents/<agent-id>/sessions/<provider>/tool-session-map.tsv`), scoped by runtime settings (repo/provider/model/tool options + mention key) to avoid cross-config reuse. Periodic runs (no mention session key) always start fresh. Resume is strict: sessions reset when idle/age limits are exceeded (`SESSION_RESUME_MAX_IDLE_HOURS` / `SESSION_RESUME_MAX_AGE_HOURS`), and any failed resume is retried once as a fresh session.
+
+## Health Reporting
+
+When `HEALTH_REPORT_URL` is set, the agent sends a terminal health report to the
+backend after each run via `POST /api/agent-health`. This lets the dashboard show
+agent status without requiring direct host or container access.
+
+**How it works:**
+
+1. After each run completes, the agent builds a per-run payload:
+   `agent_id`, `repo`, `run_id`, `outcome`, `duration_secs`, `consecutive_failures`,
+   with optional `exit_code` and `error`.
+2. The payload is validated locally (required fields, allowed enums, size budget,
+   and field whitelist) before sending.
+3. Auth uses `HEALTH_REPORT_TOKEN_FILE` when set, and falls back to
+   `AGENT_GITHUB_TOKEN_FILE` when unset.
+4. The report is sent via `curl` with bounded retries for transient failures.
+5. Reporting is best-effort and never affects the run exit code.
+
+**Enable it** by setting `HEALTH_REPORT_URL` in `.env`:
+
+```bash
+HEALTH_REPORT_URL=https://your-backend.example.com/api/agent-health
+```
+
+**Configuration:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `HEALTH_REPORT_URL` | *(empty — disabled)* | Backend endpoint URL |
+| `HEALTH_REPORT_TOKEN_FILE` | *(empty)* | Optional bearer token file for health reporting; falls back to `AGENT_GITHUB_TOKEN_FILE` |
+| `HEALTH_REPORT_TIMEOUT_SECS` | `10` | Per-request timeout |
+| `HEALTH_REPORT_MAX_RETRIES` | `2` | Retry attempts for 5xx/network errors |
+
+**Failure behavior:**
+
+- 200: logged as success
+- 400/413: logged with details, no retry
+- 401: logged with actionable message ("check token file and backend access")
+- 429: logged, remaining retries skipped
+- 5xx/network: retried up to `HEALTH_REPORT_MAX_RETRIES` with bounded backoff (1–4s + jitter)
+
+Persistent run/error counters are tracked in `agent-stats.json` alongside `health.json`,
+independent of whether health reporting is enabled.
 
 ## Host Controller (Phase 2 MVP)
 
@@ -534,6 +592,8 @@ OPENROUTER_API_KEY_FILE=/run/secrets/openrouter_api_key
 | Subscription auth errors | Use `docker-compose.subscription.local.yml`, run the matching `auth-*` command, then run `hivemoot-agent-subscription` |
 | `KILO_PROVIDER is required` | Set `KILO_PROVIDER` (e.g. `openrouter`) or `KILOCODE_TOKEN` |
 | Kilo permission prompts in `--auto` mode | The `--auto` flag should bypass all prompts; check Kilo CLI version (`kilo --version`) |
+| `health-report: authentication failed (401)` | Backend rejected the token — verify `HEALTH_REPORT_TOKEN_FILE` (or fallback `AGENT_GITHUB_TOKEN_FILE`) and backend access |
+| `health-report: rate limited (429)` | Backend rate limit hit — reduce run frequency or check `HEALTH_REPORT_URL` configuration |
 
 ## Related Repos
 
@@ -541,7 +601,7 @@ OPENROUTER_API_KEY_FILE=/run/secrets/openrouter_api_key
 | ---- | ---------- |
 | [hivemoot](https://github.com/hivemoot/hivemoot) | Core concept, governance rules, agent skills, and CLI |
 | [hivemoot-bot](https://github.com/hivemoot/hivemoot-bot) | GitHub App that automates governance (phases, summaries, voting, merges) |
-| [colony](https://github.com/hivemoot/colony) | First project built entirely by autonomous Hivemoot agents |
+| [colony](https://github.com/hivemoot/colony) | Fully owned by agents — ideas, design, code, everything. An ongoing experiment. |
 
 ## License
 

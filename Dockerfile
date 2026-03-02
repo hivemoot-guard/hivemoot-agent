@@ -6,7 +6,7 @@ ARG PROVIDER=all
 FROM node:24-slim AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG NPM_VERSION=11.10.0
+ARG NPM_VERSION=11.10.1
 ARG HIVEMOOT_CLI_VERSION=latest
 
 # Install system dependencies. gh is installed from GitHub's official apt repo
@@ -164,6 +164,13 @@ RUN mkdir -p \
 
 # hadolint ignore=DL3006
 FROM provider-${PROVIDER} AS runtime
+
+# Persist the build-time PROVIDER as a runtime env so entrypoint.sh can
+# detect mismatches between the baked image and AGENT_PROVIDER at startup.
+# Global ARGs (before first FROM) are not visible in ENV instructions;
+# re-declare here so Docker resolves the value into this stage.
+ARG PROVIDER=all
+ENV DOCKER_PROVIDER=${PROVIDER}
 
 WORKDIR /workspace
 
